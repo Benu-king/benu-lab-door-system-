@@ -1,0 +1,512 @@
+# Powered by Benayas Wondwosen
+
+import sys
+import math
+import random
+import cv2
+import mediapipe as mp
+import numpy as np
+from PyQt6 import QtCore, QtGui, QtWidgets
+from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtWidgets import QLabel, QVBoxLayout, QWidget, QHBoxLayout, QGridLayout, QProgressBar
+import pyglet
+import threading
+import time
+import serial
+from serial.tools import list_ports
+
+mp_hands = mp.solutions.hands
+hands_detector = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7, min_tracking_confidence=0.7)
+mp_draw = mp.solutions.drawing_utils
+
+def is_hand_open(hand_landmarks):
+    tips = [4, 8, 12, 16, 20]
+    knuckles = [3, 6, 10, 14, 18]
+    open_count = 0
+    for tip, knuckle in zip(tips, knuckles):
+        if hand_landmarks.landmark[tip].y < hand_landmarks.landmark[knuckle].y:
+            open_count += 1
+    return open_count >= 3
+
+class ScannerApp(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Futuristic Biometric Hand Scanner")
+        self.setGeometry(50, 50, 1500, 950)
+        self.setStyleSheet("background-color: black;")
+
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        grid = QGridLayout()
+        grid.setSpacing(12)
+        central_widget.setLayout(grid)
+
+        self.webcam_label = QLabel()
+        self.webcam_label.setFixedSize(440, 340)
+        self.webcam_label.setStyleSheet("""
+            border: 2px solid cyan;
+            background-color: #001015;
+        """)
+        grid.addWidget(self.webcam_label, 0, 0)
+
+        self.scan_line = QLabel(self.webcam_label)
+        self.scan_line.setGeometry(0, 0, 440, 6)
+        self.scan_line.setStyleSheet("background-color: rgba(0,255,120,0.7);")
+        self.scan_anim = QtCore.QPropertyAnimation(self.scan_line, b"geometry")
+        self.scan_anim.setDuration(1800)
+        self.scan_anim.setLoopCount(-1)
+        self.scan_anim.setStartValue(QtCore.QRect(0, 0, 440, 6))
+        self.scan_anim.setEndValue(QtCore.QRect(0, 334, 440, 6))
+        self.scan_anim.start()
+
+        self.code_panel = QLabel()
+        self.code_panel.setStyleSheet("""
+            color: #00ffaa;
+            font-family: Consolas;
+            font-size: 15px;
+            background-color: rgba(0,20,24,0.85);
+            border: 1px solid #00ffcc;
+        """)
+        self.code_panel.setFixedSize(440, 120)
+        self.code_panel.setWordWrap(True)
+        self.code_panel.setText("> Booting scanner modules...\n> Initializing vision pipeline...\n")
+        grid.addWidget(self.code_panel, 1, 0)
+
+        self.holo_panel = QLabel("HOLOGRAM: HAND MODEL")
+        self.holo_panel.setFixedSize(440, 200)
+        self.holo_panel.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.holo_panel.setStyleSheet("""
+            border: 2px solid magenta;
+            color: #ff66ff;
+            font-family: Consolas;
+            font-size: 16px;
+            background-color: #0a0010;
+        """)
+        grid.addWidget(self.holo_panel, 2, 0)
+
+        self.door_panel = QLabel("DOOR: CLOSED")
+        self.door_panel.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.door_panel.setFixedSize(360, 60)
+        self.door_panel.setStyleSheet("""
+            color: red;
+            font-size: 28px;
+            font-weight: bold;
+            border: 1px solid #330000;
+            background-color: #120000;
+        """)
+        grid.addWidget(self.door_panel, 3, 0)
+
+        bio_container = QWidget()
+        bio_layout = QVBoxLayout()
+        bio_container.setLayout(bio_layout)
+        bio_container.setStyleSheet("border: 1px solid #00bcd4;")
+        bio_container.setFixedSize(600, 240)
+
+        self.bio_title = QLabel("BIOMETRIC ANALYSIS")
+        self.bio_title.setStyleSheet("color:#00e5ff;font-family:Consolas;font-size:18px;")
+        self.bio_title.setFixedSize(600, 60)
+        bio_layout.addWidget(self.bio_title)
+
+        self.bio_text = QLabel("Fingerprint Hash: 9F2A-5C11-AE3B-F4D9\nRetina Pattern: LOCKED\nThermal Map: STABLE")
+        self.bio_text.setStyleSheet("color:#aaf;font-family:Consolas;font-size:14px;")
+        self.bio_text.setWordWrap(True)
+        self.bio_text.setFixedSize(600, 90)
+        bio_layout.addWidget(self.bio_text)
+
+        self.bio_match_panel = QWidget()
+        match_layout = QHBoxLayout()
+        match_layout.setContentsMargins(6, 6, 6, 6)
+        self.bio_match_panel.setLayout(match_layout)
+        self.bio_match_panel.setFixedSize(600, 50)
+
+        self.match_label = QLabel("Match Confidence")
+        self.match_label.setStyleSheet("color:#0ff;font-family:Consolas;font-size:14px;")
+        match_layout.addWidget(self.match_label)
+
+        self.match_bar = QProgressBar()
+        self.match_bar.setRange(0, 100)
+        self.match_bar.setValue(12)
+        self.match_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #0ff; color: #0ff; text-align: center;
+                background-color: #001820;
+            }
+            QProgressBar::chunk {
+                background-color: #00ffaa;
+            }
+        """)
+        self.match_bar.setFixedHeight(24)
+        self.match_bar.setFixedWidth(420)
+        match_layout.addWidget(self.match_bar)
+
+        bio_layout.addWidget(self.bio_match_panel)
+
+        self.integrity_label = QLabel("Signal Integrity")
+        self.integrity_label.setStyleSheet("color:#0ff;font-family:Consolas;font-size:14px;")
+        bio_layout.addWidget(self.integrity_label)
+
+        self.integrity_bar = QProgressBar()
+        self.integrity_bar.setRange(0, 100)
+        self.integrity_bar.setValue(68)
+        self.integrity_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #0ff; color: #0ff; text-align: center;
+                background-color: #001820;
+            }
+            QProgressBar::chunk {
+                background-color: #55aaff;
+            }
+        """)
+        self.integrity_bar.setFixedWidth(560)
+        bio_layout.addWidget(self.integrity_bar)
+
+        self.id_label = QLabel("Subject UID: S-AX17-93")
+        self.id_label.setStyleSheet("color:#8ef;font-family:Consolas;font-size:14px;")
+        self.id_label.setFixedWidth(600)
+        bio_layout.addWidget(self.id_label)
+
+        grid.addWidget(bio_container, 0, 1)
+
+        self.access_panel = QLabel("AWAITING HAND...")
+        self.access_panel.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.access_panel.setFixedSize(600, 100)
+        self.access_panel.setStyleSheet("""
+            color: yellow;
+            font-size: 26px;
+            font-weight: bold;
+            border: 1px solid #999900;
+            background-color: #101000;
+        """)
+        grid.addWidget(self.access_panel, 1, 1)
+
+        self.access_effect = QtWidgets.QGraphicsColorizeEffect()
+        self.access_panel.setGraphicsEffect(self.access_effect)
+        self.access_anim = QtCore.QPropertyAnimation(self.access_effect, b"strength")
+        self.access_anim.setDuration(800)
+        self.access_anim.setStartValue(0.1)
+        self.access_anim.setEndValue(0.7)
+        self.access_anim.setLoopCount(-1)
+        self.access_anim.start()
+
+        self.hacker_panel = QLabel(
+            "SYSTEM LOGS:\n> Loading secure modules...\n> Establishing encrypted tunnel...\n> Calibrating sensors...\n"
+            "> Waiting for biometric input...\n> Listening on /dev/camera0...\n"
+        )
+        self.hacker_panel.setFixedSize(600, 160)
+        self.hacker_panel.setStyleSheet("""
+            color:#00ff00;
+            font-family:Consolas;
+            font-size:14px;
+            border: 1px solid #00ff00;
+            background-color: #001000;
+        """)
+        self.hacker_panel.setWordWrap(True)
+        grid.addWidget(self.hacker_panel, 2, 1)
+
+        self.graph_panel = QLabel()
+        self.graph_panel.setFixedSize(600, 110)
+        self.graph_panel.setStyleSheet("border:1px solid #00ffaa; background-color:#001820;")
+        grid.addWidget(self.graph_panel, 3, 1)
+        self.graph_phase = 0.0
+
+        self.cap = cv2.VideoCapture(0)
+
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update_frame)
+        self.timer.start(30)
+
+        self.graph_timer = QtCore.QTimer()
+        self.graph_timer.timeout.connect(self.update_fake_graph)
+        self.graph_timer.start(60)
+
+        threading.Thread(target=self.start_3d_model, daemon=True).start()
+
+        self.arduino = None
+        self.arduino_port = 'COM4'
+
+        def try_open_port(port_name):
+            try:
+                s = serial.Serial(port_name, 9600, timeout=1)
+                time.sleep(2)
+                return s
+            except Exception:
+                return None
+
+        if self.arduino_port:
+            self.update_code_log(f"[ARDUINO] Attempting {self.arduino_port}...")
+            s = try_open_port(self.arduino_port)
+            if s:
+                self.arduino = s
+                self.update_code_log(f"[ARDUINO] Connected to {self.arduino_port}")
+                try:
+                    self.arduino.write(b'c')
+                    self.arduino.flush()
+                except Exception:
+                    pass
+
+        if not self.arduino:
+            ports = [p.device for p in list_ports.comports()]
+            for p in ports:
+                self.update_code_log(f"[ARDUINO] Scanning {p}...")
+                s = try_open_port(p)
+                if s:
+                    self.arduino = s
+                    self.arduino_port = p
+                    self.update_code_log(f"[ARDUINO] Auto-connected to {p}")
+                    try:
+                        self.arduino.write(b'c')
+                        self.arduino.flush()
+                    except Exception:
+                        pass
+                    break
+
+        if not self.arduino:
+            self.update_code_log("[ARDUINO] Not connected (will try on demand)")
+
+        self.last_state = None
+
+    def reconnect_arduino(self):
+        ports = [p.device for p in list_ports.comports()]
+        for p in ports:
+            try:
+                s = serial.Serial(p, 9600, timeout=1)
+                time.sleep(2)
+                self.arduino = s
+                self.arduino_port = p
+                self.update_code_log(f"[ARDUINO] Reconnected to {p}")
+                try:
+                    self.arduino.write(b'c')
+                    self.arduino.flush()
+                except Exception:
+                    pass
+                return True
+            except Exception:
+                continue
+        self.update_code_log("[ARDUINO] Reconnect failed")
+        return False
+
+    def send_arduino(self, cmd_char: str):
+        if not self.arduino:
+            self.update_code_log("[ARDUINO] Not connected. Attempting auto-reconnect...")
+            if not self.reconnect_arduino():
+                self.update_code_log("[ARDUINO] Command not sent — no connection")
+                return
+        try:
+            data = cmd_char.encode('ascii')
+            self.arduino.write(data)
+            try:
+                self.arduino.flush()
+            except Exception:
+                pass
+            self.update_code_log(f"[ARDUINO] Sent: {cmd_char} on {self.arduino_port}")
+        except Exception as e:
+            self.update_code_log(f"[ARDUINO] Send failed: {e}")
+            try:
+                self.arduino.close()
+            except Exception:
+                pass
+            self.arduino = None
+
+    def update_frame(self):
+        ret, frame = self.cap.read()
+        if not ret:
+            return
+
+        frame = cv2.flip(frame, 1)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands_detector.process(rgb_frame)
+
+        detected = False
+        hand_open = False
+
+        if results.multi_hand_landmarks:
+            detected = True
+            for hand_landmarks in results.multi_hand_landmarks:
+                mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                hand_open = is_hand_open(hand_landmarks)
+
+        if detected:
+            if hand_open:
+                self.on_access_granted()
+            else:
+                self.on_access_denied()
+        else:
+            self.on_waiting()
+
+        image = QImage(frame.data, frame.shape[1], frame.shape[0], QImage.Format.Format_BGR888)
+        pixmap = QPixmap.fromImage(image).scaled(self.webcam_label.width(), self.webcam_label.height(), QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+        self.webcam_label.setPixmap(pixmap)
+
+    def on_access_granted(self):
+        if self.last_state != "open":
+            self.update_code_log("[SCAN] Hand OPEN detected → authenticating...")
+            self.pulse_access_panel(True)
+            self.toggle_door(True)
+            self.bump_biometrics(True)
+            self.last_state = "open"
+
+    def on_access_denied(self):
+        if self.last_state != "closed":
+            self.update_code_log("[SCAN] Hand CLOSED detected → access denied.")
+            self.pulse_access_panel(False)
+            self.toggle_door(False)
+            self.bump_biometrics(False)
+            self.last_state = "closed"
+
+    def on_waiting(self):
+        if self.last_state is not None:
+            self.update_code_log("[SCAN] No hand detected → idle.")
+
+        self.access_panel.setText("AWAITING HAND...")
+        self.access_panel.setStyleSheet("""
+            color: yellow; font-size: 26px; font-weight: bold;
+            border: 1px solid #999900; background-color: #101000;
+        """)
+        self.door_panel.setText("DOOR: CLOSED")
+        self.door_panel.setStyleSheet("""
+            color: red; font-size: 28px; font-weight: bold;
+            border: 1px solid #330000; background-color: #120000;
+        """)
+        self.last_state = None
+
+    def update_code_log(self, msg):
+        current = self.code_panel.text()
+        lines = current.splitlines()
+        if len(lines) > 12:
+            lines = lines[-12:]
+        lines.append("> " + msg)
+        self.code_panel.setText("\n".join(lines))
+
+        hacker_current = self.hacker_panel.text()
+        hacker_lines = hacker_current.splitlines()
+        hacker_lines.append(f"[{QtCore.QDateTime.currentDateTime().toString('hh:mm:ss')}] {msg}")
+        if len(hacker_lines) > 20:
+            hacker_lines = hacker_lines[-20:]
+        self.hacker_panel.setText("\n".join(hacker_lines))
+
+    def toggle_door(self, open_state):
+        if open_state:
+            self.door_panel.setText("DOOR: OPEN")
+            self.door_panel.setStyleSheet("""
+                color: lime; font-size: 28px; font-weight: bold;
+                border: 1px solid #003300; background-color: #001900;
+            """)
+            try:
+                self.send_arduino('o')
+            except Exception:
+                pass
+        else:
+            self.door_panel.setText("DOOR: CLOSED")
+            self.door_panel.setStyleSheet("""
+                color: red; font-size: 28px; font-weight: bold;
+                border: 1px solid #330000; background-color: #120000;
+            """)
+            try:
+                self.send_arduino('c')
+            except Exception:
+                pass
+
+    def pulse_access_panel(self, granted):
+        if granted:
+            self.access_panel.setText("ACCESS GRANTED")
+            self.access_panel.setStyleSheet("""
+                color: lime; font-size: 28px; font-weight: bold;
+                border: 1px solid #00ff00; background-color: #001900;
+            """)
+            self.access_effect.setColor(QtGui.QColor(0, 255, 0))
+        else:
+            self.access_panel.setText("ACCESS DENIED")
+            self.access_panel.setStyleSheet("""
+                color: red; font-size: 28px; font-weight: bold;
+                border: 1px solid #ff0000; background-color: #190000;
+            """)
+            self.access_effect.setColor(QtGui.QColor(255, 0, 0))
+
+        self.access_anim.stop()
+        self.access_anim.setDuration(500 if granted else 350)
+        self.access_anim.setStartValue(0.0)
+        self.access_anim.setEndValue(0.9)
+        self.access_anim.setLoopCount(6)
+        self.access_anim.start()
+
+    def bump_biometrics(self, granted):
+        if granted:
+            self.match_bar.setValue(min(100, self.match_bar.value() + random.randint(15, 30)))
+            self.integrity_bar.setValue(min(100, self.integrity_bar.value() + random.randint(5, 12)))
+            self.bio_text.setText("Fingerprint Hash: 9F2A-5C11-AE3B-F4D9\nRetina Pattern: VERIFIED\nThermal Map: STABLE")
+            self.id_label.setText("Subject UID: S-AX17-93 (Trusted)")
+        else:
+            self.match_bar.setValue(max(0, self.match_bar.value() - random.randint(12, 24)))
+            self.integrity_bar.setValue(max(0, self.integrity_bar.value() - random.randint(4, 10)))
+            self.bio_text.setText("Fingerprint Hash: 9F2A-5C11-AE3B-F4D9\nRetina Pattern: MISMATCH\nThermal Map: IRREGULAR")
+            self.id_label.setText("Subject UID: UNKNOWN")
+
+    def update_fake_graph(self):
+        w, h = self.graph_panel.width(), self.graph_panel.height()
+        img = QtGui.QImage(w, h, QtGui.QImage.Format.Format_RGB32)
+        img.fill(QtGui.QColor(0, 24, 32))
+        painter = QtGui.QPainter(img)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+
+        grid_pen = QtGui.QPen(QtGui.QColor(0, 70, 90))
+        grid_pen.setWidth(1)
+        painter.setPen(grid_pen)
+        for x in range(0, w, 40):
+            painter.drawLine(x, 0, x, h)
+        for y in range(0, h, 20):
+            painter.drawLine(0, y, w, y)
+
+        self.graph_phase += 0.25
+        pen = QtGui.QPen(QtGui.QColor(0, 255, 180))
+        pen.setWidth(2)
+        painter.setPen(pen)
+        prev = None
+        for x in range(w):
+            t = (x / 40.0) + self.graph_phase
+            y = int(h/2 + 20 * math.sin(t) + 8 * math.sin(t*2.2) + 4 * math.sin(t*3.7))
+            if prev:
+                painter.drawLine(prev[0], prev[1], x, y)
+            prev = (x, y)
+
+        painter.end()
+        self.graph_panel.setPixmap(QPixmap.fromImage(img))
+
+    def start_3d_model(self):
+        window = pyglet.window.Window(width=440, height=200, caption="3D Hologram", visible=False)
+        window.set_visible(True)
+
+        rotation = {"angle": 0}
+
+        @window.event
+        def on_draw():
+            window.clear()
+            pyglet.gl.glClearColor(0.05, 0.0, 0.1, 1.0)
+            pyglet.gl.glLoadIdentity()
+
+            pyglet.gl.glTranslatef(220, 100, 0)
+            pyglet.gl.glRotatef(rotation["angle"], 0, 0, 1)
+
+            batch = pyglet.graphics.Batch()
+            pts = [(0, 100), (40, 40), (20, 0), (-20, 0), (-40, 40)]
+
+            for i in range(len(pts)):
+                x1, y1 = pts[i]
+                x2, y2 = pts[(i + 1) % len(pts)]
+                batch.add(2, pyglet.gl.GL_LINES, None,
+                          ("v2f", (x1, y1, x2, y2)),
+                          ("c3B", (0, 255, 255, 0, 255, 255)))
+
+            batch.draw()
+
+        def animate(dt):
+            rotation["angle"] += 40 * dt
+            rotation["angle"] %= 360
+
+        pyglet.clock.schedule_interval(animate, 1/60)
+        pyglet.app.run()
+
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
+    window = ScannerApp()
+    window.show()
+    sys.exit(app.exec())
