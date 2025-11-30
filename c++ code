@@ -1,0 +1,84 @@
+// Powered by Benayas Wondwosen
+
+#include <Servo.h>
+
+Servo myServo;
+
+const int servoPin = 9;
+const int buzzerPin = 8;
+const int redPin = 2;
+const int greenPin = 3;
+const int bluePin = 4;
+
+const int openAngle = 180;
+const int closeAngle = 60;
+
+int targetAngle = closeAngle;
+int currentAngle = closeAngle;
+
+int brightness = 0;
+int fadeAmount = 2;
+bool fadeGreen = false;
+bool fadeRed = false;
+
+void setup() {
+  Serial.begin(9600);
+  myServo.attach(servoPin);
+
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(redPin, OUTPUT);
+  pinMode(greenPin, OUTPUT);
+  pinMode(bluePin, OUTPUT);
+
+  myServo.write(closeAngle);
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    char command = Serial.read();
+
+    if (command == 'o') {
+      targetAngle = openAngle;
+
+      digitalWrite(buzzerPin, HIGH);
+      delay(200);
+      digitalWrite(buzzerPin, LOW);
+
+      fadeGreen = true;
+      fadeRed = false;
+      digitalWrite(redPin, HIGH);
+      digitalWrite(bluePin, HIGH);
+    }
+
+    else if (command == 'c') {
+      targetAngle = closeAngle;
+
+      fadeRed = true;
+      fadeGreen = false;
+      digitalWrite(greenPin, HIGH);
+      digitalWrite(bluePin, HIGH);
+    }
+  }
+
+  if (currentAngle < targetAngle) {
+    currentAngle++;
+    myServo.write(currentAngle);
+    delay(10);
+  } 
+  else if (currentAngle > targetAngle) {
+    currentAngle--;
+    myServo.write(currentAngle);
+    delay(10);
+  }
+
+  brightness += fadeAmount;
+  if (brightness <= 0 || brightness >= 255) fadeAmount = -fadeAmount;
+
+  if (fadeGreen) analogWrite(greenPin, 255 - brightness);
+  else digitalWrite(greenPin, HIGH);
+
+  if (fadeRed) analogWrite(redPin, 255 - brightness);
+  else digitalWrite(redPin, HIGH);
+
+  delay(15);
+}
